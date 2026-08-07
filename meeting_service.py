@@ -1,4 +1,4 @@
-# meeting_service.py
+# meeting_service.py claude
 import os
 import uuid
 import math
@@ -11,19 +11,16 @@ import pathlib
 import threading
 import time as time_module
 import boto3
-import redis
 import json
 import urllib.parse
-import snowflake.connector
 import traceback
+import oracledb
 import requests as http_requests  # renamed to avoid clash with FastAPI
 import numpy as np
 from kafka import KafkaProducer, KafkaConsumer
 from datetime import datetime, timedelta, timezone
 from datetime import time as dt_time
 from typing import Optional, List, Dict, Any, Tuple
-from botocore.config import Config
-from botocore.exceptions import BotoCoreError, ClientError
 from fastapi.requests import Request
 from fastapi import FastAPI, HTTPException, Header, Depends, status, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -32,17 +29,13 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel, EmailStr
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
-from snowflake.connector import errors
 from sklearn.linear_model import Ridge, LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics import r2_score, accuracy_score
 from fastapi.responses import RedirectResponse, JSONResponse
 from fastapi import Form
-from cryptography.hazmat.backends import default_backend
-from cryptography.hazmat.primitives import serialization
 from dotenv import load_dotenv
-from boto3.dynamodb.conditions import Key, Attr
 
 # Load .env FIRST so os.getenv() calls below pick up .env values
 load_dotenv(dotenv_path=pathlib.Path(__file__).parent / ".env", override=False)
@@ -60,7 +53,6 @@ INTERNSHIP_SERVICE_URL  = os.getenv("INTERNSHIP_SERVICE_URL",  "http://127.0.0.1
 MS365_SERVICE_URL       = os.getenv("MS365_SERVICE_URL",       "http://127.0.0.1:7700")
 EMPLOYEE_SERVICE_URL    = os.getenv("EMPLOYEE_SERVICE_URL",    "http://127.0.0.1:8002")
 BLOGGER_SERVICE_URL     = os.getenv("BLOGGER_SERVICE_URL",     "http://127.0.0.1:7500")
-REDIS_SERVICE_URL       = os.getenv("REDIS_SERVICE_URL",       "http://127.0.0.1:6380")
 BRS_SERVICE_URL         = os.getenv("BRS_SERVICE_URL",         "http://127.0.0.1:8020")
 BILLING_SERVICE_URL     = os.getenv("BILLING_SERVICE_URL",     "http://127.0.0.1:8010")
 RAG_SERVICE_URL         = os.getenv("RAG_SERVICE_URL",         "http://127.0.0.1:7900")
@@ -78,10 +70,6 @@ app = FastAPI(title="meeting_service")
 # ------------------------------
 MS_ORGANIZER = os.getenv("MS_ORGANIZER", "support@chakorahub.com")
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
-
-# DynamoDB setup
-dynamodb = boto3.resource('dynamodb', region_name='eu-north-1')
-bookings_table = dynamodb.Table('Bookings')
 
 # ── Kafka Producer ──────────────────────────────────────────────
 _kafka_producer = None
@@ -119,7 +107,7 @@ def _verify_razorpay_signature(order_id: str, payment_id: str, signature: str) -
     return hmac.compare_digest(expected, signature)
 
 def _consume_teams_link_created() -> None:
-    """Consume teams.link.created and persist Teams link in DynamoDB."""
+    """Consume teams.link.created and persist Teams link in Oracle."""
     try:
         consumer = KafkaConsumer(
             "teams.link.created",
@@ -147,39 +135,20 @@ def _consume_teams_link_created() -> None:
 
         try:
             if incoming_meeting_id:
-                bookings_table.update_item(
-                    Key={"bookingId": booking_id},
-                    UpdateExpression="""
-                        SET teams_link = :tl,
-                            teams_link_created_at = :ts,
-                            meeting_id = :mid,
-                            transcript_status = :status,
-                            transcript_s3_key = :s3key
-                    """,
-                    ExpressionAttributeValues={
-                        ":tl": teams_link,
-                        ":ts": datetime.utcnow().isoformat(),
-                        ":mid": incoming_meeting_id,
-                        ":status": "PENDING",
-                        ":s3key": ""
-                    },
+                bookings_table.update_teams_link(
+                    booking_id=booking_id,
+                    teams_link=teams_link,
+                    meeting_id=incoming_meeting_id,
+                    transcript_status="PENDING",
+                    transcript_s3_key="",
                 )
                 print(f"✅ Teams link updated with meeting_id | booking_id={booking_id} | meeting_id={incoming_meeting_id}")
             else:
-                bookings_table.update_item(
-                    Key={"bookingId": booking_id},
-                    UpdateExpression="""
-                        SET teams_link = :tl,
-                            teams_link_created_at = :ts,
-                            transcript_status = :status,
-                            transcript_s3_key = :s3key
-                    """,
-                    ExpressionAttributeValues={
-                        ":tl": teams_link,
-                        ":ts": datetime.utcnow().isoformat(),
-                        ":status": "PENDING",
-                        ":s3key": ""
-                    },
+                bookings_table.update_teams_link(
+                    booking_id=booking_id,
+                    teams_link=teams_link,
+                    transcript_status="PENDING",
+                    transcript_s3_key="",
                 )
                 print(f"⚠️ Teams link updated without meeting_id (preserving existing DB meeting_id) | booking_id={booking_id}")
             print(f"✅ Teams link updated | booking_id={booking_id}")
@@ -228,25 +197,22 @@ POLL_INTERVAL_SECONDS = 60   # check every minute
 
 def _process_completed_bookings():
     """
-    Background thread: poll DynamoDB for completed bookings without feedback sent,
+    Background thread: poll Oracle for completed bookings without feedback sent,
     and call student_service to generate feedback links.
     """
     while True:
         try:
-            # Scan for bookings with status = 'COMPLETED' and feedback_sent missing or false
-            response = bookings_table.scan(
-                FilterExpression=(
-                    Attr('status').eq('COMPLETED') &
-                    (Attr('feedback_sent').not_exists() | Attr('feedback_sent').eq(False))
-                )
-            )
-            items = response.get('Items', [])
-            print(f"📋 Found {len(items)} completed bookings without feedback sent.")
+            items = bookings_table.get_completed_bookings()
+            print(f"📋 Found {len(items)} completed bookings to process.")
 
             for item in items:
                 booking_id = item['bookingId']
                 student_email = item.get('student_email', '')
                 student_name = item.get('created_by', 'Student')  # fallback
+                feedback_marker_key = f"meeting:feedback:sent:{booking_id}"
+
+                if _rs_exists(feedback_marker_key):
+                    continue
 
                 if not student_email:
                     print(f"⚠️ Skipping booking {booking_id}: no student_email")
@@ -267,15 +233,8 @@ def _process_completed_bookings():
                     )
                     if resp.status_code == 200:
                         print(f"✅ Feedback triggered for booking {booking_id}")
-                        # Update DynamoDB to mark feedback sent
-                        bookings_table.update_item(
-                            Key={'bookingId': booking_id},
-                            UpdateExpression="SET feedback_sent = :sent, feedback_generated_at = :ts",
-                            ExpressionAttributeValues={
-                                ':sent': True,
-                                ':ts': datetime.utcnow().isoformat()
-                            }
-                        )
+                        bookings_table.mark_feedback_sent(booking_id)
+                        _rs_set(feedback_marker_key, "1", 7 * 24 * 3600)
                     else:
                         print(f"⚠️ Feedback API error for {booking_id}: {resp.status_code} - {resp.text}")
                 except Exception as e:
@@ -292,18 +251,541 @@ def _process_completed_bookings():
 # ------------------------------
 # ENV & AWS CLIENTS
 # ------------------------------
-BOOKINGS_TABLE = os.getenv("BOOKINGS_TABLE", "Bookings")
 AWS_REGION = os.getenv("AWS_REGION", "eu-north-1")
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "admin@chakorahub.com")
 ADMIN_PANEL_URL = os.getenv(
     "ADMIN_PANEL_URL",
     "https://www.chakorahub.com/meeting/admin"
 )
+ORACLE_HOST = os.getenv("ORACLE_HOST", "56.228.73.210")
+ORACLE_PORT = int(os.getenv("ORACLE_PORT", "1521"))
+ORACLE_SERVICE_NAME = os.getenv("ORACLE_SERVICE_NAME", "FREEPDB1")
+ORACLE_USER = os.getenv("ORACLE_USER", "SUPPORT")
+ORACLE_PASSWORD = os.getenv("ORACLE_PASSWORD", "Welcome123")
+ORACLE_SCHEMA = (os.getenv("ORACLE_SCHEMA", "CHAKORA") or "CHAKORA").strip().upper()
 
-boto_config = Config(region_name=AWS_REGION)
-dynamodb = boto3.resource("dynamodb", config=boto_config)
 ses = boto3.client("ses", region_name=AWS_REGION)
-bookings_table = dynamodb.Table(BOOKINGS_TABLE)
+
+
+def get_connection():
+    dsn = oracledb.makedsn(
+        host=ORACLE_HOST,
+        port=ORACLE_PORT,
+        service_name=ORACLE_SERVICE_NAME,
+    )
+    conn = oracledb.connect(
+        user=ORACLE_USER,
+        password=ORACLE_PASSWORD,
+        dsn=dsn,
+    )
+    cursor = conn.cursor()
+    try:
+        cursor.execute(f"ALTER SESSION SET CURRENT_SCHEMA = {ORACLE_SCHEMA}")
+    finally:
+        cursor.close()
+    return conn
+
+
+def _json_default(value: Any):
+    if isinstance(value, decimal.Decimal):
+        return float(value)
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return str(value)
+
+
+class MeetingDAO:
+    TABLE_NAME = f"{ORACLE_SCHEMA}.NRM_MEETINGS"
+
+    SELECT_SQL = f"""
+        SELECT
+            BOOKING_ID, BOOKING_DATE, START_TIME, END_TIME, STUDENT_EMAIL,
+            ORGANIZER_EMAIL, BOOKING_TYPE, PURPOSE, COMPLEXITY, DURATION_MINUTES,
+            PRICE, HEURISTIC_PRICE, HEURISTIC_DEMAND_FACTOR, HEURISTIC_SUPPLY_FACTOR,
+            HEURISTIC_SLOT_TIME_FACTOR, HEURISTIC_LEAD_TIME_FACTOR, ML_PREDICTED_PRICE,
+            ML_BOUNDED_PRICE, ML_DEMAND_SCORE, ML_LEAD_TIME, PRICING_STRATEGY,
+            PRICING_CONFIDENCE, PRICING_MODEL_VERSION, PRICING_MODEL_R2,
+            PRICING_TRAINING_SAMPLES, IS_EXISTING, MEETING_LINK, PAYMENT_STATUS,
+            RAZORPAY_ORDER_ID, RAZORPAY_PAYMENT_ID, STATUS, CREATED_BY, CREATED_AT,
+            UPDATED_AT, START_TS, MEETING_MODE, CANCELLATION_REASON, ML_MODEL_NAME
+        FROM {TABLE_NAME}
+    """
+
+    @staticmethod
+    def _to_date(value: Any):
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return value.date()
+        if hasattr(value, "year") and not isinstance(value, str):
+            return value
+        try:
+            return datetime.strptime(str(value)[:10], "%Y-%m-%d").date()
+        except Exception:
+            return None
+
+    @staticmethod
+    def _to_datetime(value: Any):
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return value
+        try:
+            return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except Exception:
+            return None
+
+    @staticmethod
+    def _to_bool_num(value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        return 1 if bool(value) else 0
+
+    @staticmethod
+    def _to_bool_char(value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        return "Y" if bool(value) else "N"
+
+    @staticmethod
+    def _row_to_item(columns: List[str], row: tuple) -> Dict[str, Any]:
+        raw = dict(zip(columns, row))
+
+        def _num(v):
+            if isinstance(v, decimal.Decimal):
+                return float(v)
+            return v
+
+        def _date(v):
+            try:
+                return v.strftime("%Y-%m-%d")
+            except Exception:
+                return v
+
+        def _ts(v):
+            try:
+                return v.isoformat()
+            except Exception:
+                return v
+
+        item = {
+            "bookingId": raw.get("BOOKING_ID"),
+            "booking_date": _date(raw.get("BOOKING_DATE")),
+            "start_time": raw.get("START_TIME"),
+            "end_time": raw.get("END_TIME"),
+            "student_email": raw.get("STUDENT_EMAIL"),
+            "organizer_email": raw.get("ORGANIZER_EMAIL"),
+            "booking_type": raw.get("BOOKING_TYPE"),
+            "purpose": raw.get("PURPOSE"),
+            "complexity": raw.get("COMPLEXITY"),
+            "duration_minutes": _num(raw.get("DURATION_MINUTES")),
+            "price": _num(raw.get("PRICE")),
+            "heuristic_price": _num(raw.get("HEURISTIC_PRICE")),
+            "heuristic_demand_factor": _num(raw.get("HEURISTIC_DEMAND_FACTOR")),
+            "heuristic_supply_factor": _num(raw.get("HEURISTIC_SUPPLY_FACTOR")),
+            "heuristic_slot_time_factor": _num(raw.get("HEURISTIC_SLOT_TIME_FACTOR")),
+            "heuristic_lead_time_factor": _num(raw.get("HEURISTIC_LEAD_TIME_FACTOR")),
+            "ml_predicted_price": _num(raw.get("ML_PREDICTED_PRICE")),
+            "ml_bounded_price": _num(raw.get("ML_BOUNDED_PRICE")),
+            "ml_demand_score": _num(raw.get("ML_DEMAND_SCORE")),
+            "ml_lead_time": _num(raw.get("ML_LEAD_TIME")),
+            "pricing_strategy": raw.get("PRICING_STRATEGY"),
+            "pricing_confidence": _num(raw.get("PRICING_CONFIDENCE")),
+            "pricing_model_version": raw.get("PRICING_MODEL_VERSION"),
+            "pricing_model_r2": _num(raw.get("PRICING_MODEL_R2")),
+            "pricing_training_samples": _num(raw.get("PRICING_TRAINING_SAMPLES")),
+            "is_existing": str(raw.get("IS_EXISTING") or "").strip().upper() in ("Y", "1", "TRUE"),
+            "teams_link": raw.get("MEETING_LINK"),
+            "payment_status": raw.get("PAYMENT_STATUS"),
+            "razorpay_order_id": raw.get("RAZORPAY_ORDER_ID"),
+            "razorpay_payment_id": raw.get("RAZORPAY_PAYMENT_ID"),
+            "status": raw.get("STATUS"),
+            "created_by": raw.get("CREATED_BY"),
+            "created_at": _ts(raw.get("CREATED_AT")),
+            "updated_at": _ts(raw.get("UPDATED_AT")),
+            "start_ts": raw.get("START_TS"),
+            "meeting_mode": raw.get("MEETING_MODE"),
+            "cancellation_reason": raw.get("CANCELLATION_REASON"),
+            "ml_model_name": raw.get("ML_MODEL_NAME"),
+        }
+        if item.get("start_ts") is None and item.get("start_time"):
+            try:
+                item["start_ts"] = to_minutes(item["start_time"])
+            except Exception:
+                pass
+        return {k: v for k, v in item.items() if v is not None}
+
+    def create_booking(self, item: Dict[str, Any]) -> None:
+        conn = get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                f"""
+                INSERT INTO {self.TABLE_NAME} (
+                    BOOKING_ID, BOOKING_DATE, START_TIME, END_TIME, STUDENT_EMAIL,
+                    ORGANIZER_EMAIL, BOOKING_TYPE, PURPOSE, COMPLEXITY, DURATION_MINUTES,
+                    PRICE, HEURISTIC_PRICE, HEURISTIC_DEMAND_FACTOR, HEURISTIC_SUPPLY_FACTOR,
+                    HEURISTIC_SLOT_TIME_FACTOR, HEURISTIC_LEAD_TIME_FACTOR, ML_PREDICTED_PRICE,
+                    ML_BOUNDED_PRICE, ML_DEMAND_SCORE, ML_LEAD_TIME, PRICING_STRATEGY,
+                    PRICING_CONFIDENCE, PRICING_MODEL_VERSION, PRICING_MODEL_R2,
+                    PRICING_TRAINING_SAMPLES, IS_EXISTING, MEETING_LINK, PAYMENT_STATUS,
+                    RAZORPAY_ORDER_ID, RAZORPAY_PAYMENT_ID, STATUS, CREATED_BY, CREATED_AT, UPDATED_AT,
+                    MEETING_MODE, CANCELLATION_REASON, ML_MODEL_NAME
+                ) VALUES (
+                    :1,:2,:3,:4,:5,:6,:7,:8,:9,:10,
+                    :11,:12,:13,:14,:15,:16,:17,:18,:19,:20,
+                    :21,:22,:23,:24,:25,:26,:27,:28,:29,:30,
+                    :31,:32,:33,:34,:35,:36,:37
+                )
+                """,
+                (
+                    item.get("bookingId"),
+                    self._to_date(item.get("booking_date")),
+                    item.get("start_time"),
+                    item.get("end_time"),
+                    item.get("student_email"),
+                    item.get("organizer_email"),
+                    item.get("booking_type"),
+                    item.get("purpose"),
+                    item.get("complexity"),
+                    item.get("duration_minutes"),
+                    item.get("price"),
+                    item.get("heuristic_price"),
+                    item.get("heuristic_demand_factor"),
+                    item.get("heuristic_supply_factor"),
+                    item.get("heuristic_slot_time_factor"),
+                    item.get("heuristic_lead_time_factor"),
+                    item.get("ml_predicted_price"),
+                    item.get("ml_bounded_price"),
+                    item.get("ml_demand_score"),
+                    item.get("ml_lead_time"),
+                    item.get("pricing_strategy"),
+                    item.get("pricing_confidence"),
+                    item.get("pricing_model_version"),
+                    item.get("pricing_model_r2"),
+                    item.get("pricing_training_samples"),
+                    self._to_bool_char(item.get("is_existing")),
+                    item.get("teams_link"),
+                    item.get("payment_status"),
+                    item.get("razorpay_order_id"),
+                    item.get("razorpay_payment_id"),
+                    item.get("status"),
+                    item.get("created_by"),
+                    self._to_datetime(item.get("created_at")) or datetime.utcnow(),
+                    self._to_datetime(item.get("updated_at")) or datetime.utcnow(),
+                    item.get("meeting_mode"),
+                    item.get("cancellation_reason"),
+                    item.get("ml_model_name"),
+                ),
+            )
+            conn.commit()
+        finally:
+            cursor.close()
+            conn.close()
+
+    def get_booking(self, booking_id: str) -> Optional[Dict[str, Any]]:
+        conn = get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(f"{self.SELECT_SQL} WHERE BOOKING_ID = :1", (booking_id,))
+            row = cursor.fetchone()
+            columns = [c[0] for c in cursor.description]
+            conn.commit()
+            if not row:
+                return None
+            return self._row_to_item(columns, row)
+        finally:
+            cursor.close()
+            conn.close()
+
+    def update_booking(self, booking_id: str, fields: Dict[str, Any]) -> None:
+        conn = get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                f"""
+                UPDATE {self.TABLE_NAME}
+                SET PURPOSE = COALESCE(:1, PURPOSE),
+                    COMPLEXITY = COALESCE(:2, COMPLEXITY),
+                    DURATION_MINUTES = COALESCE(CAST(:3 AS NUMBER), DURATION_MINUTES),
+                    STATUS = COALESCE(:4, STATUS),
+                    MEETING_LINK = COALESCE(:5, MEETING_LINK),
+                    PAYMENT_STATUS = COALESCE(:6, PAYMENT_STATUS),
+                    RAZORPAY_ORDER_ID = COALESCE(:7, RAZORPAY_ORDER_ID),
+                    RAZORPAY_PAYMENT_ID = COALESCE(:8, RAZORPAY_PAYMENT_ID),
+                    CANCELLATION_REASON = COALESCE(:9, CANCELLATION_REASON),
+                    ML_MODEL_NAME = COALESCE(:10, ML_MODEL_NAME),
+                    UPDATED_AT = SYSTIMESTAMP
+                WHERE BOOKING_ID = :11
+                """,
+                (
+                    fields.get("purpose"),
+                    fields.get("complexity"),
+                    fields.get("duration_minutes"),
+                    fields.get("status"),
+                    fields.get("teams_link"),
+                    fields.get("payment_status"),
+                    fields.get("razorpay_order_id"),
+                    fields.get("razorpay_payment_id"),
+                    fields.get("cancellation_reason"),
+                    fields.get("ml_model_name"),
+                    booking_id,
+                ),
+            )
+            conn.commit()
+        finally:
+            cursor.close()
+            conn.close()
+
+    def update_status(self, booking_id: str, status: str) -> None:
+        conn = get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                f"UPDATE {self.TABLE_NAME} SET STATUS = :1, UPDATED_AT = SYSTIMESTAMP WHERE BOOKING_ID = :2",
+                (status, booking_id),
+            )
+            conn.commit()
+        finally:
+            cursor.close()
+            conn.close()
+
+    def update_payment(self, booking_id: str, payment_status: str, order_id: str, payment_id: str) -> None:
+        conn = get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                f"""
+                UPDATE {self.TABLE_NAME}
+                SET PAYMENT_STATUS = :1,
+                    RAZORPAY_ORDER_ID = :2,
+                    RAZORPAY_PAYMENT_ID = :3,
+                    UPDATED_AT = SYSTIMESTAMP
+                WHERE BOOKING_ID = :4
+                """,
+                (payment_status, order_id, payment_id, booking_id),
+            )
+            conn.commit()
+        finally:
+            cursor.close()
+            conn.close()
+
+    def update_teams_link(
+        self,
+        booking_id: str,
+        teams_link: str,
+        meeting_id: Optional[str] = None,
+        transcript_status: str = "PENDING",
+        transcript_s3_key: str = "",
+    ) -> None:
+        conn = get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                f"""
+                UPDATE {self.TABLE_NAME}
+                SET MEETING_LINK = :1,
+                    UPDATED_AT = SYSTIMESTAMP
+                WHERE BOOKING_ID = :2
+                """,
+                (teams_link, booking_id),
+            )
+            conn.commit()
+        finally:
+            cursor.close()
+            conn.close()
+
+    def update_transcript(self, booking_id: str, transcript_status: str, transcript_s3_key: str) -> None:
+        # Kept for backward compatibility with old call sites.
+        return
+
+    def mark_feedback_sent(self, booking_id: str) -> None:
+        # FEEDBACK_* columns do not exist in current NRM_MEETINGS schema.
+        return
+
+    def get_existing_bookings(self, identity: Optional[str] = None) -> List[Dict[str, Any]]:
+        conn = get_connection()
+        cursor = conn.cursor()
+        try:
+            if identity:
+                cursor.execute(
+                    f"""
+                    {self.SELECT_SQL}
+                    WHERE (LOWER(CREATED_BY) = :1 OR LOWER(STUDENT_EMAIL) = :2)
+                      AND STATUS NOT IN ('CANCELLED', 'REJECTED')
+                    ORDER BY CREATED_AT DESC
+                    """,
+                    (identity.lower(), identity.lower()),
+                )
+            else:
+                cursor.execute(f"{self.SELECT_SQL} ORDER BY CREATED_AT DESC")
+            rows = cursor.fetchall()
+            columns = [c[0] for c in cursor.description]
+            conn.commit()
+            return [self._row_to_item(columns, row) for row in rows]
+        finally:
+            cursor.close()
+            conn.close()
+
+    def get_bookings_by_student(self, identity: str) -> List[Dict[str, Any]]:
+        conn = get_connection()
+        cursor = conn.cursor()
+        try:
+            norm = (identity or "").strip().lower()
+            cursor.execute(
+                f"""
+                {self.SELECT_SQL}
+                WHERE LOWER(STUDENT_EMAIL) = :1 OR LOWER(CREATED_BY) = :2
+                ORDER BY CREATED_AT DESC
+                """,
+                (norm, norm),
+            )
+            rows = cursor.fetchall()
+            columns = [c[0] for c in cursor.description]
+            conn.commit()
+            return [self._row_to_item(columns, row) for row in rows]
+        finally:
+            cursor.close()
+            conn.close()
+
+    def get_bookings_by_date(self, booking_date: str) -> List[Dict[str, Any]]:
+        conn = get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                f"{self.SELECT_SQL} WHERE BOOKING_DATE = :1 ORDER BY START_TIME ASC",
+                (self._to_date(booking_date),),
+            )
+            rows = cursor.fetchall()
+            columns = [c[0] for c in cursor.description]
+            conn.commit()
+            return [self._row_to_item(columns, row) for row in rows]
+        finally:
+            cursor.close()
+            conn.close()
+
+    def get_completed_bookings(self) -> List[Dict[str, Any]]:
+        conn = get_connection()
+        cursor = conn.cursor()
+        try:
+            query_tail = """
+                WHERE STATUS = 'COMPLETED'
+                ORDER BY UPDATED_AT DESC
+            """
+            try:
+                cursor.execute(f"""{self.SELECT_SQL}{query_tail}""")
+            except oracledb.DatabaseError as exc:
+                err = exc.args[0] if exc.args else None
+                if getattr(err, "code", None) != 942:
+                    raise
+                # Runtime fallback for environments where schema grants/synonyms differ.
+                candidates = [
+                    self.TABLE_NAME,
+                    "NRM_MEETINGS",
+                    f"{ORACLE_USER}.NRM_MEETINGS",
+                    "CHAKORA.NRM_MEETINGS",
+                ]
+                attempted = set()
+                recovered = False
+                for table_name in candidates:
+                    normalized = (table_name or "").strip().upper()
+                    if not normalized or normalized in attempted:
+                        continue
+                    attempted.add(normalized)
+                    try:
+                        cursor.execute(
+                            f"""
+                            SELECT
+                                BOOKING_ID, BOOKING_DATE, START_TIME, END_TIME, STUDENT_EMAIL,
+                                ORGANIZER_EMAIL, BOOKING_TYPE, PURPOSE, COMPLEXITY, DURATION_MINUTES,
+                                PRICE, HEURISTIC_PRICE, HEURISTIC_DEMAND_FACTOR, HEURISTIC_SUPPLY_FACTOR,
+                                HEURISTIC_SLOT_TIME_FACTOR, HEURISTIC_LEAD_TIME_FACTOR, ML_PREDICTED_PRICE,
+                                ML_BOUNDED_PRICE, ML_DEMAND_SCORE, ML_LEAD_TIME, PRICING_STRATEGY,
+                                PRICING_CONFIDENCE, PRICING_MODEL_VERSION, PRICING_MODEL_R2,
+                                PRICING_TRAINING_SAMPLES, IS_EXISTING, MEETING_LINK, PAYMENT_STATUS,
+                                RAZORPAY_ORDER_ID, RAZORPAY_PAYMENT_ID, STATUS, CREATED_BY, CREATED_AT,
+                                UPDATED_AT, START_TS, MEETING_MODE, CANCELLATION_REASON, ML_MODEL_NAME
+                            FROM {table_name}
+                            {query_tail}
+                            """
+                        )
+                        print(f"✅ get_completed_bookings fallback table resolved to: {table_name}")
+                        recovered = True
+                        break
+                    except oracledb.DatabaseError:
+                        continue
+                if not recovered:
+                    raise
+
+            rows = cursor.fetchall()
+            columns = [c[0] for c in cursor.description]
+            conn.commit()
+            return [self._row_to_item(columns, row) for row in rows]
+        finally:
+            cursor.close()
+            conn.close()
+
+    def get_pending_bookings(self) -> List[Dict[str, Any]]:
+        conn = get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(f"{self.SELECT_SQL} WHERE STATUS = 'PENDING' ORDER BY CREATED_AT DESC")
+            rows = cursor.fetchall()
+            columns = [c[0] for c in cursor.description]
+            conn.commit()
+            return [self._row_to_item(columns, row) for row in rows]
+        finally:
+            cursor.close()
+            conn.close()
+
+    def count_active_by_identity(self, identity: str) -> int:
+        conn = get_connection()
+        cursor = conn.cursor()
+        try:
+            norm = (identity or "").strip().lower()
+            if not norm:
+                return 0
+            cursor.execute(
+                f"""
+                SELECT COUNT(*)
+                FROM {self.TABLE_NAME}
+                                WHERE (LOWER(STUDENT_EMAIL) = :1 OR LOWER(CREATED_BY) = :2)
+                  AND STATUS NOT IN ('CANCELLED', 'REJECTED')
+                """,
+                                (norm, norm),
+            )
+            row = cursor.fetchone()
+            conn.commit()
+            return int((row[0] if row else 0) or 0)
+        finally:
+            cursor.close()
+            conn.close()
+
+    def cancel_booking(self, booking_id: str) -> None:
+        conn = get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                f"UPDATE {self.TABLE_NAME} SET STATUS = 'CANCELLED', UPDATED_AT = SYSTIMESTAMP WHERE BOOKING_ID = :1",
+                (booking_id,),
+            )
+            conn.commit()
+        finally:
+            cursor.close()
+            conn.close()
+
+    def delete_booking(self, booking_id: str) -> None:
+        conn = get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(f"DELETE FROM {self.TABLE_NAME} WHERE BOOKING_ID = :1", (booking_id,))
+            conn.commit()
+        finally:
+            cursor.close()
+            conn.close()
+
+
+bookings_table = MeetingDAO()
 
 # Employees
 
@@ -394,76 +876,28 @@ def start_teams_link_consumer() -> None:
     t3.start()
     print("🚀 Background thread started: completed-bookings-processor")
 # ------------------------------
-# REDIS CONFIGURATION (Direct client — fallback for internal ops only)
-# The meeting module uses redis_service HTTP API for all locking / availability.
-# This direct client is kept ONLY for the pricing-model cache that does NOT
-# need per-slot locking semantics.
+# In-memory cache backend (external cache decoupled)
 # ------------------------------
-REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
-REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
-REDIS_DB = int(os.getenv("REDIS_DB", "0"))
-REDIS_PASSWORD = os.getenv("REDIS_PASSWORD") or None
+_CACHE_LOCAL: Dict[str, Any] = {}
 
-# DB 8 is reserved for the meeting service (availability + locking + pending holds)
-# All meeting-specific keys go through redis_service HTTP endpoints /meeting/...
-# The direct Redis client below is DB 0 (pricing model cache only).
-def create_redis_client() -> Optional[redis.Redis]:
-    try:
-        client = redis.Redis(
-            host=REDIS_HOST,
-            port=REDIS_PORT,
-            db=REDIS_DB,
-            password=REDIS_PASSWORD,
-            decode_responses=True,
-            socket_connect_timeout=2,
-            socket_timeout=2,
-            retry_on_timeout=True,
-            health_check_interval=30,
-        )
-        client.ping()
-        print(
-            f"✅ Redis connected | host={REDIS_HOST} port={REDIS_PORT} db={REDIS_DB} "
-            f"password_set={bool(REDIS_PASSWORD)}"
-        )
-        return client
-    except Exception as exc:
-        print(f"⚠️ Redis unavailable, continuing without cache: {exc}")
+
+def cache_get_safe(key: str) -> Optional[str]:
+    value = _CACHE_LOCAL.get(key)
+    if value is None:
         return None
+    if isinstance(value, dict):
+        return value.get("value")
+    return value
 
 
-redis_client = create_redis_client()
+def cache_setex_safe(key: str, ttl: int, value: str) -> bool:
+    _CACHE_LOCAL[key] = {"value": value, "ttl": ttl, "ts": time_module.time()}
+    return True
 
 
-def redis_get_safe(key: str) -> Optional[str]:
-    if redis_client is None:
-        return None
-    try:
-        return redis_client.get(key)
-    except Exception as exc:
-        print(f"⚠️ Redis GET failed for {key}: {exc}")
-        return None
-
-
-def redis_setex_safe(key: str, ttl: int, value: str) -> bool:
-    if redis_client is None:
-        return False
-    try:
-        redis_client.setex(key, ttl, value)
-        return True
-    except Exception as exc:
-        print(f"⚠️ Redis SETEX failed for {key}: {exc}")
-        return False
-
-
-def redis_delete_safe(key: str) -> bool:
-    if redis_client is None:
-        return False
-    try:
-        redis_client.delete(key)
-        return True
-    except Exception as exc:
-        print(f"⚠️ Redis DELETE failed for {key}: {exc}")
-        return False
+def cache_delete_safe(key: str) -> bool:
+    _CACHE_LOCAL.pop(key, None)
+    return True
 
 # Cache TTLs from your Phase 4 Architecture diagram
 TTL_EMPLOYEES = 3600    # 1 Hour
@@ -499,21 +933,14 @@ COMPLEXITY_MIN_CONFIDENCE  = 0.55   # below this RF/LR confidence → return Non
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# REDIS-SERVICE HTTP HELPERS  (DB 8 — meeting: namespace)
-# ──────────────────────────────────────────────────────────────────────────────
-# All slot availability, locking, and pending-hold operations are delegated to
-# the shared redis_service microservice (port 6380).  This keeps the Redis
-# logic decoupled from the meeting module exactly as requested.
+# CACHE HELPERS (meeting namespace)
 #
-# Key schema (DB 8):
+# Key schema:
 #   meeting:slots:{date}              → JSON list of all slot dicts with availability
 #   meeting:lock:slot:{slot_key}      → short TTL lock (15–30 sec) prevents double-booking
 #   meeting:pending:{auth_identifier} → temporary hold (TTL 90 sec) while payment flows
 #   meeting:user:{auth_identifier}    → short TTL user booking summary (read acceleration)
 # ──────────────────────────────────────────────────────────────────────────────
-
-# DB index used inside redis_service for meeting-specific keys
-_MEETING_DB = 8
 
 MEETING_SLOTS_KEY_PREFIX = "meeting:slots:"
 MEETING_SLOT_LOCK_KEY_PREFIX = "meeting:lock:slot:"
@@ -521,11 +948,12 @@ MEETING_PENDING_HOLD_KEY_PREFIX = "meeting:pending:"
 MEETING_USER_CACHE_KEY_PREFIX = "meeting:user:"
 MEETING_STUDENT_KEY_PREFIX = "meeting:student:"
 
-# TTLs for meeting-specific Redis keys
+# TTLs for meeting-specific cache keys
 TTL_SLOT_LOCK    = 120    # seconds — short lock while payment is being processed
 TTL_PENDING_HOLD = 180    # seconds — temporary hold while Razorpay checkout is open
 TTL_SLOT_AVAIL   = 300   # seconds — availability cache (5 min), same as TTL_SLOTS
 TTL_USER_CACHE   = 120   # seconds — per-user booking list (2 min)
+TTL_PERSISTENT_MARKER = 315_360_000  # 10 years
 
 
 def _meeting_slots_key(date: str) -> str:
@@ -549,64 +977,24 @@ def _meeting_student_key(auth_identifier: str) -> str:
 
 
 def _rs_get(key: str) -> Optional[Any]:
-    """GET a key from redis_service (meeting DB)."""
-    try:
-        resp = http_requests.get(
-            f"{REDIS_SERVICE_URL}/redis/get",
-            params={"key": key, "db": _MEETING_DB},
-            timeout=3,
-        )
-        data = resp.json()
-        if data.get("success") and data.get("found"):
-            return data["value"]
-        return None
-    except Exception as exc:
-        print(f"⚠️ redis_service GET {key} failed: {exc}")
-        return None
+    return cache_get_safe(key)
 
 
 def _rs_set(key: str, value: str, ttl: int) -> Optional[bool]:
-    """SETEX a key in redis_service (meeting DB)."""
-    try:
-        resp = http_requests.post(
-            f"{REDIS_SERVICE_URL}/redis/set",
-            json={"key": key, "value": value, "db": _MEETING_DB, "ttl": ttl},
-            timeout=3,
-        )
-        return resp.json().get("success", False)
-    except Exception as exc:
-        print(f"⚠️ redis_service SET {key} failed: {exc}")
-        return None
+    return cache_setex_safe(key, ttl, value)
 
 
 def _rs_delete(keys: List[str]) -> bool:
-    """DELETE one or more keys from redis_service (meeting DB)."""
+    """DELETE one or more keys from local cache backend."""
     if not keys:
         return True
-    try:
-        resp = http_requests.post(
-            f"{REDIS_SERVICE_URL}/redis/delete",
-            json={"keys": keys, "db": _MEETING_DB},
-            timeout=3,
-        )
-        return resp.json().get("success", False)
-    except Exception as exc:
-        print(f"⚠️ redis_service DELETE {keys} failed: {exc}")
-        return False
+    for key in keys:
+        cache_delete_safe(key)
+    return True
 
 
 def _rs_exists(key: str) -> Optional[bool]:
-    """Check key existence via redis_service (meeting DB)."""
-    try:
-        resp = http_requests.get(
-            f"{REDIS_SERVICE_URL}/redis/exists",
-            params={"key": key, "db": _MEETING_DB},
-            timeout=3,
-        )
-        return resp.json().get("exists", False)
-    except Exception as exc:
-        print(f"⚠️ redis_service EXISTS {key} failed: {exc}")
-        return None
+    return cache_get_safe(key) is not None
 
 
 # ── Slot availability cache ────────────────────────────────────────────────────
@@ -632,12 +1020,12 @@ def meeting_slots_cache_invalidate(date: str) -> bool:
     try:
         result = _rs_delete([_meeting_slots_key(date)])
         if result:
-            print(f"✅ Redis: Slot cache invalidated | date={date}")
+            print(f"✅ Cache: Slot cache invalidated | date={date}")
         else:
-            print(f"⚠️ Redis: Slot cache invalidation returned False | date={date}")
+            print(f"⚠️ Cache: Slot cache invalidation returned False | date={date}")
         return result
     except Exception as e:
-        print(f"❌ Redis: Slot cache invalidation failed | date={date} error={e}")
+        print(f"❌ Cache: Slot cache invalidation failed | date={date} error={e}")
         return False
 
 
@@ -652,30 +1040,29 @@ def meeting_slot_lock_acquire(slot_key: str, holder: str) -> bool:
 
     Returns True if the lock was acquired, False if already held.
 
-    Implementation note:
-      redis_service exposes only SET (with ttl) and EXISTS.  We simulate SETNX by
+        Implementation note:
+            The cache backend exposes only SET (with ttl) and EXISTS. We simulate SETNX by
       checking EXISTS first then SET.  There is a tiny race window, but for a
       booking flow (where Razorpay payment is the authoritative serialisation point)
-      this is acceptable.  A future upgrade can add a native /redis/setnx endpoint
-      to redis_service to make this fully atomic.
+            this is acceptable.
     """
     lock_key = _meeting_slot_lock_key(slot_key)
     exists = _rs_exists(lock_key)
     if exists is None:
-        raise RuntimeError("redis_service unavailable during lock existence check")
+        raise RuntimeError("cache backend unavailable during lock existence check")
     if exists:
         print(f"ℹ️ Slot lock acquire blocked | slot={slot_key} holder={holder} reason=exists_true")
         return False   # already locked by another request
     set_ok = _rs_set(lock_key, holder, TTL_SLOT_LOCK)
     if set_ok is None:
-        raise RuntimeError("redis_service unavailable during lock write")
+        raise RuntimeError("cache backend unavailable during lock write")
     if not set_ok:
         print(f"⚠️ Slot lock acquire set failed | slot={slot_key} holder={holder}")
     return set_ok
 
 
 def meeting_slot_lock_release(slot_key: str) -> None:
-    """Release the slot lock (called after DynamoDB write succeeds or on failure)."""
+    """Release the slot lock (called after Oracle write succeeds or on failure)."""
     _rs_delete([_meeting_slot_lock_key(slot_key)])
 
 
@@ -768,71 +1155,42 @@ def meeting_student_marker_get(auth_identifier: str) -> Optional[dict]:
 
 
 def meeting_student_marker_set(auth_identifier: str, marker: dict) -> bool:
-    """Store a no-TTL student marker so DB 8 has durable per-student identity keys."""
+    """Store a long-lived student marker for fast returning-user checks."""
     if not auth_identifier:
         return False
     try:
-        resp = http_requests.post(
-            f"{REDIS_SERVICE_URL}/redis/set",
-            json={
-                "key": _meeting_student_key(auth_identifier),
-                "value": json.dumps(marker),
-                "db": _MEETING_DB,
-            },
-            timeout=3,
-        )
-        ok = resp.json().get("success", False)
+        ok = bool(_rs_set(_meeting_student_key(auth_identifier), json.dumps(marker), TTL_PERSISTENT_MARKER))
         if ok:
-            print(f"✅ Redis: Student marker updated | user={auth_identifier}")
+            print(f"✅ Cache: Student marker updated | user={auth_identifier}")
         else:
-            print(f"⚠️ Redis: Student marker update returned False | user={auth_identifier}")
+            print(f"⚠️ Cache: Student marker update returned False | user={auth_identifier}")
         return ok
     except Exception as exc:
-        print(f"⚠️ Redis: Student marker update failed | user={auth_identifier} error={exc}")
+        print(f"⚠️ Cache: Student marker update failed | user={auth_identifier} error={exc}")
         return False
 
 
 # Helper to always return a fresh DB connection with RSA key authentication
 def get_db_connection():
     try:
-        # Load RSA private key
-        # Get the directory where meeting_service.py is located
-        BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-        key_path = os.path.join(BASE_DIR, 'rsa_key.p8')
-
-        with open(key_path, 'rb') as key_file:
-            private_key = serialization.load_pem_private_key(
-                key_file.read(),
-                password=None,
-                backend=default_backend()
-            )
-        
-        # Convert private key to bytes
-        pkb = private_key.private_bytes(
-            encoding=serialization.Encoding.DER,
-            format=serialization.PrivateFormat.PKCS8,
-            encryption_algorithm=serialization.NoEncryption()
-        )
-        
-        # Connect to Snowflake using RSA key
-        conn = snowflake.connector.connect(
-            user='ChakoraHub',
-            account='gpguymt-ta88699',
-            private_key=pkb,
-            warehouse='COMPUTE_WH',
-            database='"VSRSUBHASH$CHAKORA_DB"',
-            schema="CHAKORA"
-        )
-        print("✅ Connected to Snowflake using RSA key")
+        conn = get_connection()
+        print("✅ Connected to Oracle")
         return conn
-        
     except Exception as e:
         print("❌ DB Connection Error:", e)
         return None
 
+
+def _fetchone_dict(cursor):
+    row = cursor.fetchone()
+    if not row:
+        return None
+    columns = [col[0] for col in cursor.description]
+    return dict(zip(columns, row))
+
 def get_current_user(credentials: HTTPBasicCredentials = Depends(security)):
     """
-    Verifies Basic Auth credentials against the Snowflake database.
+    Verifies Basic Auth credentials against the Oracle database.
     Returns a dict with username and role.
     """
     username = credentials.username
@@ -860,18 +1218,18 @@ def get_current_user(credentials: HTTPBasicCredentials = Depends(security)):
     if conn is None:
         raise HTTPException(status_code=500, detail="Database connection failed")
 
-    cursor = conn.cursor(snowflake.connector.DictCursor)
+    cursor = conn.cursor()
     try:
-        # Fetch user data including type/role - using %(name)s format for Snowflake
+        # Fetch user data including type/role
         cursor.execute("""
             SELECT u.EMAIL, u.PHONE, u.USERTYPE, l.PASSWORD 
             FROM nrm_users u
             JOIN nrm_logins l ON u.ID = l.USER_ID
-            WHERE u.EMAIL = %(username)s OR u.PHONE = %(username)s
-            LIMIT 1
+            WHERE u.EMAIL = :username OR u.PHONE = :username
+            FETCH FIRST 1 ROWS ONLY
         """, {"username": username})
-        
-        user = cursor.fetchone()
+
+        user = _fetchone_dict(cursor)
         
         if not user:
             raise HTTPException(
@@ -1019,7 +1377,7 @@ async def user_nrm_logins(request: Request):
         )
 
     try:
-        cursor = conn.cursor(snowflake.connector.DictCursor)
+        cursor = conn.cursor()
 
         if login_type == 'admin':
             admin_username = form.get('admin_username', '').strip()
@@ -1034,11 +1392,11 @@ async def user_nrm_logins(request: Request):
                        l.PASSWORD
                 FROM nrm_users u
                 JOIN nrm_logins l ON u.ID = l.USER_ID
-                WHERE (u.EMAIL = %s OR u.PHONE = %s) AND u.USERTYPE = 'admin'
-                LIMIT 1
+                WHERE (u.EMAIL = :1 OR u.PHONE = :2) AND u.USERTYPE = 'admin'
+                FETCH FIRST 1 ROWS ONLY
             """, (admin_username, admin_username))
 
-            admin_row = cursor.fetchone()
+            admin_row = _fetchone_dict(cursor)
             if not admin_row:
                 return JSONResponse(
                     content={"message": "Invalid admin credentials"},
@@ -1076,11 +1434,11 @@ async def user_nrm_logins(request: Request):
                        l.PASSWORD
                 FROM nrm_users u
                 JOIN nrm_logins l ON u.ID = l.USER_ID
-                WHERE u.EMAIL = %s OR u.PHONE = %s
-                LIMIT 1
+                WHERE u.EMAIL = :1 OR u.PHONE = :2
+                FETCH FIRST 1 ROWS ONLY
             """, (email_or_phone, email_or_phone))
 
-            user_row = cursor.fetchone()
+            user_row = _fetchone_dict(cursor)
             if not user_row:
                 return JSONResponse(content={"message": "Invalid user credentials"}, status_code=401)
 
@@ -1185,20 +1543,18 @@ def get_rag_context_for_suggestion(student_email: str, booking_reason: str) -> s
         print(f"⚠️ RAG context fetch failed: {exc}")
         return ""
 
-def scan_all_bookings(filter_expression=None) -> List[dict]:
-    scan_kwargs = {}
-    if filter_expression is not None:
-        scan_kwargs["FilterExpression"] = filter_expression
-
-    response = bookings_table.scan(**scan_kwargs)
-    items = response.get("Items", [])
-
-    while "LastEvaluatedKey" in response:
-        scan_kwargs["ExclusiveStartKey"] = response["LastEvaluatedKey"]
-        response = bookings_table.scan(**scan_kwargs)
-        items.extend(response.get("Items", []))
-
-    return items
+def scan_all_bookings(
+    booking_date: Optional[str] = None,
+    created_by: Optional[str] = None,
+    identity: Optional[str] = None,
+) -> List[dict]:
+    if booking_date:
+        return bookings_table.get_bookings_by_date(booking_date)
+    if created_by:
+        return bookings_table.get_existing_bookings(created_by)
+    if identity:
+        return bookings_table.get_existing_bookings(identity)
+    return bookings_table.get_existing_bookings()
 
 
 def count_active_bookings(bookings: List[dict]) -> int:
@@ -1330,7 +1686,7 @@ def train_pricing_model(bookings: List[dict]) -> Dict[str, Any]:
 
 def get_cached_pricing_model() -> Optional[Dict[str, Any]]:
     try:
-        cached_model = redis_get_safe(PRICING_MODEL_CACHE_KEY)
+        cached_model = cache_get_safe(PRICING_MODEL_CACHE_KEY)
         if not cached_model:
             return None
         return json.loads(cached_model)
@@ -1341,7 +1697,7 @@ def get_cached_pricing_model() -> Optional[Dict[str, Any]]:
 
 def cache_pricing_model(model: Dict[str, Any]) -> None:
     try:
-        redis_setex_safe(PRICING_MODEL_CACHE_KEY, TTL_PRICING_MODEL, json.dumps(model))
+        cache_setex_safe(PRICING_MODEL_CACHE_KEY, TTL_PRICING_MODEL, json.dumps(model))
     except Exception as exc:
         print(f"Pricing model cache write failed: {exc}")
 
@@ -1406,14 +1762,14 @@ def optimize_predicted_price(
 # ══════════════════════════════════════════════════════════════════════════════
 # AUTO SUGGESTION ML SYSTEM
 # Stack (per deployment diagram):
-#   Storage:           DynamoDB  (same bookings_table)
+#   Storage:           Oracle  (same bookings_table)
 #   Feature Eng:       pandas-style manual (no pandas import needed)
 #   Semantic Features: BGE-M3 embeddings via RAG service
 #   ML Framework:      scikit-learn
 #   ML Models:         Ridge (duration) + LogisticRegression + RandomForest (complexity)
-#   Model Storage:     joblib-serialised payload cached in Redis DB 0
+#   Model Storage:     joblib-serialised payload cached in Cache DB 0
 #   Inference API:     this file (FastAPI  /meeting/agentic-suggestions)
-#   Caching:           Redis DB 0 (pricing model) + DB 8 (per-request embedding cache)
+#   Caching:           Cache DB 0 (pricing model) + DB 8 (per-request embedding cache)
 #   Monitoring:        PM2 logs  (existing)
 #   Retraining:        /pricing-model/train also retrains suggestion model
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1429,7 +1785,7 @@ def get_bge_embedding(text: str) -> Optional[List[float]]:
     if not text:
         return None
 
-    # Check embedding cache in redis_service DB 8
+    # Check embedding cache in local cache DB 8
     cache_key = f"{BGE_EMBEDDING_CACHE_PREFIX}{abs(hash(text)) % (10 ** 12)}"
     cached = _rs_get(cache_key)
     if cached:
@@ -1449,7 +1805,7 @@ def get_bge_embedding(text: str) -> Optional[List[float]]:
             return None
         vec = resp.json().get("embedding")
         if isinstance(vec, list) and len(vec) > 0:
-            # Cache in redis_service DB 8 for 24 h
+            # Cache in local cache DB 8 for 24 h
             _rs_set(cache_key, json.dumps(vec), BGE_EMBEDDING_CACHE_TTL)
         return vec
     except Exception as exc:
@@ -1504,7 +1860,7 @@ def build_suggestion_feature_vector(
 
 def build_suggestion_training_rows(bookings: List[dict]) -> List[dict]:
     """
-    Extract labelled rows from historical DynamoDB bookings for suggestion training.
+    Extract labelled rows from historical Oracle bookings for suggestion training.
     Each row becomes a training sample for both sub-models:
         - duration_label  → Ridge regression target
         - complexity_label → LogisticRegression + RandomForest target
@@ -1558,7 +1914,7 @@ def train_auto_suggestion_model(bookings: List[dict]) -> Dict[str, Any]:
         2. Logistic Regression → suggest complexity (multi-class)
         3. Random Forest       → suggest complexity (ensemble, for confidence)
 
-    Returns a serialisable dict stored in Redis DB 0.
+    Returns a serialisable dict stored in Cache DB 0.
     """
     rows = build_suggestion_training_rows(bookings)
 
@@ -1681,11 +2037,11 @@ def _ridge_predict_duration(model_data: Dict, features: List[float]) -> Optional
     return result
 
 
-# ── Auto suggestion model cache (Redis DB 0 — same pool as pricing model) ─────
+# ── Auto suggestion model cache (Cache DB 0 — same pool as pricing model) ─────
 
 def get_cached_auto_suggestion_model() -> Optional[Dict[str, Any]]:
     try:
-        raw = redis_get_safe(AUTO_SUGGESTION_CACHE_KEY)
+        raw = cache_get_safe(AUTO_SUGGESTION_CACHE_KEY)
         if not raw:
             return None
         return json.loads(raw)
@@ -1696,7 +2052,7 @@ def get_cached_auto_suggestion_model() -> Optional[Dict[str, Any]]:
 
 def cache_auto_suggestion_model(model: Dict[str, Any]) -> None:
     try:
-        redis_setex_safe(AUTO_SUGGESTION_CACHE_KEY, AUTO_SUGGESTION_CACHE_TTL, json.dumps(model))
+        cache_setex_safe(AUTO_SUGGESTION_CACHE_KEY, AUTO_SUGGESTION_CACHE_TTL, json.dumps(model))
     except Exception as exc:
         print(f"⚠️ Auto suggestion cache write failed: {exc}")
 
@@ -2371,17 +2727,17 @@ def send_booking_email(
 
 @app.get("/meeting-purposes")
 def get_meeting_purposes():
-    """Return list of purposes - CACHED in Redis for 24 hours"""
+    """Return list of purposes - CACHED in Cache for 24 hours"""
     cache_key = "meeting_purposes"
     
-    cached_data = redis_get_safe(cache_key)
+    cached_data = cache_get_safe(cache_key)
     if cached_data:
-        print("🚀 Redis Cache Hit: meeting-purposes")
+        print("🚀 Cache Cache Hit: meeting-purposes")
         return {"purposes": json.loads(cached_data)}
     
-    print("❄️ Cache Miss: Returning static list and updating Redis")
+    print("❄️ Cache Miss: Returning static list and updating Cache")
     purposes = VALID_PURPOSES
-    redis_setex_safe(cache_key, TTL_PURPOSES, json.dumps(purposes))
+    cache_setex_safe(cache_key, TTL_PURPOSES, json.dumps(purposes))
 
     return {"purposes": purposes}
 
@@ -2393,57 +2749,8 @@ def meeting_identify(req: IdentityLookupRequest):
     if not identity:
         raise HTTPException(status_code=400, detail="identity is required")
 
-    # Cache-aside: Redis first (student:profile), DynamoDB on cache miss.
-    profile_key = f"student:profile:{identity}"
-    try:
-        r = http_requests.get(
-            f"{REDIS_SERVICE_URL}/redis/get",
-            params={"key": profile_key, "db": 1},
-            timeout=3,
-        )
-        data = r.json() if r.ok else {}
-        if data.get("success") and data.get("found"):
-            cached = json.loads(data.get("value") or "{}")
-            return {
-                "success": True,
-                "exists": bool(cached.get("exists", False)),
-                "total_bookings": int(cached.get("total_bookings", 0) or 0),
-                "cache_hit": True,
-            }
-    except Exception as exc:
-        print(f"⚠️ student:profile cache read failed | identity={identity} | error={exc}")
-
-    # Cache miss → DynamoDB fallback
-    bookings = scan_all_bookings(
-        filter_expression=(
-            boto3.dynamodb.conditions.Attr("created_by").eq(identity)
-            | boto3.dynamodb.conditions.Attr("student_email").eq(identity)
-        )
-    )
-    total_bookings = count_active_bookings(bookings)
-
-    # Cache-aside write-back (TTL 30 min) on positive hit.
-    if total_bookings > 0:
-        now_iso = datetime.utcnow().isoformat()
-        profile_payload = {
-            "identity": identity,
-            "exists": True,
-            "total_bookings": total_bookings,
-            "last_seen": now_iso,
-        }
-        try:
-            http_requests.post(
-                f"{REDIS_SERVICE_URL}/redis/set",
-                json={
-                    "key": profile_key,
-                    "value": json.dumps(profile_payload),
-                    "db": 1,
-                    "ttl": 1800,
-                },
-                timeout=3,
-            )
-        except Exception as exc:
-            print(f"⚠️ student:profile cache write failed | identity={identity} | error={exc}")
+    # Use direct aggregate count from Oracle for deterministic UI truth.
+    total_bookings = bookings_table.count_active_by_identity(identity)
 
     return {
         "success": True,
@@ -2455,17 +2762,17 @@ def meeting_identify(req: IdentityLookupRequest):
 
 @app.get("/employees/list")
 def list_employees():
-    """Return list of employees - CACHED in Redis for 1 hour"""
+    """Return list of employees - CACHED in Cache for 1 hour"""
     cache_key = "employee_list"
     
-    cached_data = redis_get_safe(cache_key)
+    cached_data = cache_get_safe(cache_key)
     if cached_data:
-        print("🚀 Redis Cache Hit: employees-list")
+        print("🚀 Cache Cache Hit: employees-list")
         return {"employees": json.loads(cached_data)}
     
-    print("❄️ Cache Miss: Updating Employee Redis Cache")
+    print("❄️ Cache Miss: Updating Employee Cache Cache")
     employees = EMPLOYEE_EMAILS
-    redis_setex_safe(cache_key, TTL_EMPLOYEES, json.dumps(employees))
+    cache_setex_safe(cache_key, TTL_EMPLOYEES, json.dumps(employees))
     
     return {"employees": employees}
 
@@ -2500,16 +2807,16 @@ def meeting_slots(date: str):
     Return available slots for a date.
 
     Flow:
-      1. Check redis_service (DB 8) for cached slot availability (TTL 5 min).
-      2. On miss, scan DynamoDB to compute availability.
-      3. Store result back in redis_service.
+      1. Check local cache (DB 8) for cached slot availability (TTL 5 min).
+      2. On miss, scan Oracle to compute availability.
+      3. Store result back in local cache.
       4. Any slot that is currently locked (meeting:lock:slot:*) is shown as
          unavailable in the response so the UI reflects real-time holds.
     """
-    # 1. Check redis_service availability cache
+    # 1. Check local cache availability cache
     cached = meeting_slots_cache_get(date)
     if cached:
-        print(f"🚀 Redis Cache Hit (redis_service DB 8): slots for {date}")
+        print(f"🚀 Cache Cache Hit (local cache DB 8): slots for {date}")
         cached_slots = cached.get("slots") if isinstance(cached, dict) else None
         if isinstance(cached_slots, list):
             for slot in cached_slots:
@@ -2523,16 +2830,14 @@ def meeting_slots(date: str):
                     slot["available"] = False
         return cached
 
-    # 2. Cache miss — compute from DynamoDB
-    print(f"❄️ Cache Miss: Scanning DynamoDB for slots on {date}")
+    # 2. Cache miss — compute from Oracle
+    print(f"❄️ Cache Miss: Scanning Oracle for slots on {date}")
     try:
         check_date = datetime.fromisoformat(date).date()
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid date format")
 
-    bookings = scan_all_bookings(
-        filter_expression=boto3.dynamodb.conditions.Attr("booking_date").eq(date)
-    )
+    bookings = scan_all_bookings(booking_date=date)
     occupied = []
     for b in bookings:
         if b.get("status") not in ("CANCELLED", "REJECTED"):
@@ -2552,7 +2857,7 @@ def meeting_slots(date: str):
                 available = False
                 break
 
-        # Also mark as unavailable if the slot is currently locked in Redis
+        # Also mark as unavailable if the slot is currently locked in Cache
         slot_key = f"{date}:{from_minutes(current)}:{GRID_MINUTES}"
         if available and _rs_exists(_meeting_slot_lock_key(slot_key)):
             available = False  # held by another user in checkout
@@ -2562,7 +2867,7 @@ def meeting_slots(date: str):
 
     result = {"date": date, "slots": slots}
     
-    # 3. Store in redis_service (DB 8) for 5 minutes
+    # 3. Store in local cache (DB 8) for 5 minutes
     meeting_slots_cache_set(date, result)
 
     return result
@@ -2600,14 +2905,15 @@ def pricing_model_train(user=Depends(get_current_user)):
 
 
 @app.post("/meeting/agentic-suggestions")
+@app.post("/meeting/api/agentic-suggestions")
 def meeting_agentic_suggestions(req: AutoSuggestionRequest):
     """
     Auto Suggestion endpoint.
 
     Returns ML-driven suggestions for duration and complexity based on:
-      - Student's booking history (DynamoDB)
+      - Student's booking history (Oracle)
       - Free-text booking reason semantics (BGE-M3 via RAG service)
-      - Current day demand (DynamoDB)
+      - Current day demand (Oracle)
       - Lead time
 
     Models:
@@ -2642,10 +2948,8 @@ def meeting_agentic_suggestions(req: AutoSuggestionRequest):
     # ── Demand signal ─────────────────────────────────────────────────────────
     current_day_demand = 0
     if req.date:
-        print(f"📊 Scanning DynamoDB for demand on {req.date}")
-        day_bookings = scan_all_bookings(
-            filter_expression=boto3.dynamodb.conditions.Attr("booking_date").eq(req.date)
-        )
+        print(f"📊 Scanning Oracle for demand on {req.date}")
+        day_bookings = scan_all_bookings(booking_date=req.date)
         current_day_demand = count_active_bookings(day_bookings)
         print(f"✅ Current day demand: {current_day_demand} active bookings")
 
@@ -2658,12 +2962,10 @@ def meeting_agentic_suggestions(req: AutoSuggestionRequest):
             is_existing = True
             print(f"✅ Marker found | existing=True")
         else:
-            print(f"⚠️ No marker, scanning DynamoDB for previous bookings...")
-            existing_bookings = scan_all_bookings(
-                filter_expression=boto3.dynamodb.conditions.Attr("created_by").eq(email)
-            )
+            print(f"⚠️ No marker, scanning Oracle for previous bookings...")
+            existing_bookings = scan_all_bookings(created_by=email)
             is_existing = count_active_bookings(existing_bookings) > 0
-            print(f"✅ DynamoDB check | existing={is_existing} | total_bookings={len(existing_bookings)}")
+            print(f"✅ Oracle check | existing={is_existing} | total_bookings={len(existing_bookings)}")
     else:
         print(f"⚠️ No email provided | is_existing=False")
 
@@ -2682,24 +2984,6 @@ def meeting_agentic_suggestions(req: AutoSuggestionRequest):
         except Exception as rag_err:
             print(f"⚠️ RAG fetch failed, continuing without context: {type(rag_err).__name__}: {rag_err}")
             rag_context = ""
-    else:
-        print(f"⚠️ RAG context skipped | is_existing={is_existing} has_email={email is not None}")
-
-    # ── Load / train suggestion model ─────────────────────────────────────────
-    print(f"🤖 Loading/training auto suggestion model...")
-    model = get_or_train_auto_suggestion_model()
-    print(f"✅ Model loaded | status={model.get('status')} | training_samples={model.get('training_samples')}")
-
-    # ── RAG context (past session summaries) ──────────────────────────────────
-    rag_context = ""
-    if is_existing and email:
-        print(f"📚 Fetching RAG context for {email}...")
-        try:                                          # ← ADD try/except here
-            rag_context = get_rag_context_for_suggestion(email, booking_reason or "")
-            print(f"✅ RAG context retrieved | len={len(rag_context)} chars")
-        except Exception as rag_err:
-            print(f"⚠️ RAG fetch failed, continuing without context: {type(rag_err).__name__}: {rag_err}")
-            rag_context = ""                          # ← graceful degradation
     else:
         print(f"⚠️ RAG context skipped | is_existing={is_existing} has_email={email is not None}")
 
@@ -2776,7 +3060,7 @@ def meeting_hold(req: PendingHoldRequest, user=Depends(get_current_user)):
 
     Flow:
       1. Validate date/time.
-      2. Try to acquire a short-TTL slot lock in Redis (prevents double-booking).
+      2. Try to acquire a short-TTL slot lock in Cache (prevents double-booking).
       3. Store a pending hold keyed by user_id (TTL 90 sec).
       4. Return hold details so the frontend can proceed to Razorpay.
 
@@ -2895,19 +3179,23 @@ def meeting_price_preview(
     lead_time_days = (dt_start.date() - now.date()).days
     start_minutes = to_minutes(start_time)
 
-    day_bookings = scan_all_bookings(
-        filter_expression=boto3.dynamodb.conditions.Attr("booking_date").eq(date)
-    )
-    current_day_demand = count_active_bookings(day_bookings)
+    # Fallback defaults so preview can still be returned if Oracle read fails.
+    current_day_demand = 0
+    is_existing_customer = False
 
-    marker = meeting_student_marker_get(lookup_user)
-    if marker:
-        is_existing_customer = True
-    else:
-        existing_user_bookings = scan_all_bookings(
-            filter_expression=boto3.dynamodb.conditions.Attr("created_by").eq(lookup_user)
-        )
-        is_existing_customer = count_active_bookings(existing_user_bookings) > 0
+    try:
+        day_bookings = scan_all_bookings(booking_date=date)
+        current_day_demand = count_active_bookings(day_bookings)
+
+        marker = meeting_student_marker_get(lookup_user)
+        if marker:
+            is_existing_customer = True
+        else:
+            existing_user_bookings = scan_all_bookings(created_by=lookup_user)
+            is_existing_customer = count_active_bookings(existing_user_bookings) > 0
+    except Exception as exc:
+        print(f"⚠️ meeting-price-preview data fetch fallback | error={exc}")
+        traceback.print_exc()
 
     heuristic_price, heuristic_breakdown = calculate_dynamic_price(
         is_existing=is_existing_customer,
@@ -2929,19 +3217,28 @@ def meeting_price_preview(
             "heuristic_breakdown": heuristic_breakdown,
         }
 
-    model = get_or_train_pricing_model()
-    feature_vector = build_feature_vector(
-        duration_minutes=duration_minutes,
-        complexity=complexity,
-        demand_score=current_day_demand,
-        lead_time_days=lead_time_days,
-        team_size=1,
-        is_internal=is_internal,
-        is_existing=is_existing_customer,
-        start_minutes=start_minutes,
-    )
-    ml_price = predict_price_from_model(model, feature_vector)
-    price, pricing_context = optimize_predicted_price(heuristic_price, ml_price, model)
+    try:
+        model = get_or_train_pricing_model()
+        feature_vector = build_feature_vector(
+            duration_minutes=duration_minutes,
+            complexity=complexity,
+            demand_score=current_day_demand,
+            lead_time_days=lead_time_days,
+            team_size=1,
+            is_internal=is_internal,
+            is_existing=is_existing_customer,
+            start_minutes=start_minutes,
+        )
+        ml_price = predict_price_from_model(model, feature_vector)
+        price, pricing_context = optimize_predicted_price(heuristic_price, ml_price, model)
+    except Exception as exc:
+        print(f"⚠️ meeting-price-preview ML fallback | error={exc}")
+        traceback.print_exc()
+        price = heuristic_price
+        pricing_context = {
+            "ml_predicted_price": None,
+            "strategy": "heuristic_fallback",
+        }
 
     return {
         "price": price,
@@ -2959,14 +3256,14 @@ def meeting_book(req: BookingRequest):
     """
     Create a new booking with Dynamic Pricing and Heuristic optimization.
 
-    Full Redis → DynamoDB flow:
+    Full Cache → Oracle flow:
       1. Verify Razorpay payment signature.
-      2. Acquire slot lock in Redis via redis_service (DB 8) — rejects if another
+      2. Acquire slot lock in Cache via local cache (DB 8) — rejects if another
          user holds the lock (double-booking guard).
-      3. Write booking to DynamoDB (authoritative source of truth).
-      4. On DynamoDB success:
-           a. Invalidate slot availability cache for the date (redis_service DB 8).
-           b. Invalidate per-user booking cache (redis_service DB 8).
+      3. Write booking to Oracle (authoritative source of truth).
+      4. On Oracle success:
+           a. Invalidate slot availability cache for the date (local cache DB 8).
+           b. Invalidate per-user booking cache (local cache DB 8).
            c. Release slot lock.
            d. Clear pending hold.
       5. Send email notifications.
@@ -3045,7 +3342,7 @@ def meeting_book(req: BookingRequest):
             )
         booking_payment_status = "PAID"
 
-    # 5. SLOT LOCK (double-booking guard via redis_service DB 8)
+    # 5. SLOT LOCK (double-booking guard via local cache DB 8)
     slot_key = f"{req.date}:{req.start_time}:{final_duration}"
     pending_hold = meeting_pending_hold_get(booking_actor)
     has_matching_pending_hold = meeting_pending_hold_matches_slot(
@@ -3097,7 +3394,7 @@ def meeting_book(req: BookingRequest):
                 f"slot={slot_key} lock_holder={lock_holder}"
             )
 
-            # Fallback for transient redis_service inconsistency: a stale exists/set
+            # Fallback for transient local cache inconsistency: a stale exists/set
             # race can return False while no reliable holder is visible.
             if not lock_holder:
                 print(f"⚠️ Retrying slot lock after stale/empty holder | slot={slot_key}")
@@ -3140,18 +3437,14 @@ def meeting_book(req: BookingRequest):
             print(f"🔒 Reacquired expired slot lock from pending hold | user={booking_actor} slot={slot_key}")
 
     # 6. DEMAND / PRICING
-    day_bookings = scan_all_bookings(
-        filter_expression=boto3.dynamodb.conditions.Attr("booking_date").eq(req.date)
-    )
+    day_bookings = scan_all_bookings(booking_date=req.date)
     current_day_demand = count_active_bookings(day_bookings)
 
     marker = meeting_student_marker_get(booking_actor)
     if marker:
         is_existing_customer = True
     else:
-        existing_user_bookings = scan_all_bookings(
-            filter_expression=boto3.dynamodb.conditions.Attr("created_by").eq(booking_actor)
-        )
+        existing_user_bookings = scan_all_bookings(created_by=booking_actor)
         is_existing_customer = count_active_bookings(existing_user_bookings) > 0
 
     lead_time_days = (dt_start.date() - now.date()).days
@@ -3232,12 +3525,12 @@ def meeting_book(req: BookingRequest):
         item["ml_bounded_price"] = decimal.Decimal(str(pricing_context["bounded_ml_price"]))
 
     try:
-        bookings_table.put_item(Item=item)  
-        print(f"✅ DynamoDB booking written | booking_id={booking_id}")
+        bookings_table.create_booking(item)
+        print(f"✅ Oracle booking written | booking_id={booking_id}")
     except Exception as dynamo_err:
-        # DynamoDB write failed — release lock so other users are not blocked
+        # Oracle write failed — release lock so other users are not blocked
         meeting_slot_lock_release(slot_key)
-        print(f"❌ DynamoDB write failed: {dynamo_err}")
+        print(f"❌ Oracle write failed: {dynamo_err}")
         raise HTTPException(status_code=500, detail="Failed to save booking. Please try again.")
 
     meeting_student_marker_set(
@@ -3251,7 +3544,7 @@ def meeting_book(req: BookingRequest):
         },
     )
 
-    # 8. REDIS CACHE CLEANUP (post-DynamoDB success)
+    # 8. CACHE CLEANUP (post-Oracle success)
     meeting_slots_cache_invalidate(req.date)
     meeting_user_cache_invalidate(booking_actor)
     meeting_slot_lock_release(slot_key)
@@ -3309,15 +3602,11 @@ def meeting_update_purpose(req: BookingPurposeRequest):
         raise HTTPException(status_code=400, detail="purpose is required")
 
     try:
-        existing = bookings_table.get_item(Key={"bookingId": booking_id}).get("Item")
+        existing = bookings_table.get_booking(booking_id)
         if not existing:
             raise HTTPException(status_code=404, detail="Booking not found")
 
-        bookings_table.update_item(
-            Key={"bookingId": booking_id},
-            UpdateExpression="SET purpose = :purpose",
-            ExpressionAttributeValues={":purpose": purpose},
-        )
+        bookings_table.update_booking(booking_id, {"purpose": purpose})
 
         student_email = (existing.get("student_email") or "").strip()
         teams_link = existing.get("teams_link") or ""
@@ -3367,10 +3656,10 @@ def meeting_update_purpose(req: BookingPurposeRequest):
 #     if user["role"] != "student":
 #         raise HTTPException(status_code=403, detail="Students only")
 
-#     # Try redis_service user cache first (DB 8)
+#     # Try local cache user cache first (DB 8)
 #     cached = meeting_user_cache_get(user["username"])
 #     if cached is not None:
-#         print(f"🚀 Redis Cache Hit (redis_service DB 8): user bookings for {user['username']}")
+#         print(f"🚀 Cache Cache Hit (local cache DB 8): user bookings for {user['username']}")
 #         return {"bookings": cached}
 
 #     bookings = scan_all_bookings(
@@ -3384,17 +3673,13 @@ def meeting_update_purpose(req: BookingPurposeRequest):
 
 #     return {"bookings": serialisable}
 
-# DynamoDB setup
-dynamodb = boto3.resource('dynamodb', region_name='eu-north-1')
-bookings_table = dynamodb.Table('Bookings')
-
 @app.get("/meeting/user-bookings")
 async def get_user_bookings(
     email: Optional[str] = Query(None),
     phone: Optional[str] = Query(None)
 ):
     """
-    Fetch all bookings for a user (by email or phone) from DynamoDB.
+    Fetch all bookings for a user (by email or phone) from Oracle.
     Used by read-through cache strategy.
     """
     
@@ -3418,24 +3703,12 @@ async def get_user_bookings(
                 "total": len(cached_bookings),
                 "search_field": "student_email",
                 "search_value": normalized_email,
-                "source": "redis",
+                "source": "cache",
             }
     
     try:
-        # Query DynamoDB
-        response = bookings_table.scan(
-            FilterExpression=Key(search_field).eq(search_value)
-        )
-        
-        bookings = response.get('Items', [])
-        
-        # Handle pagination if needed
-        while 'LastEvaluatedKey' in response:
-            response = bookings_table.scan(
-                FilterExpression=Key(search_field).eq(search_value),
-                ExclusiveStartKey=response['LastEvaluatedKey']
-            )
-            bookings.extend(response.get('Items', []))
+        # Query Oracle
+        bookings = bookings_table.get_bookings_by_student(search_value)
         
         response_payload = {
             "success": True,
@@ -3443,7 +3716,7 @@ async def get_user_bookings(
             "total": len(bookings),
             "search_field": search_field,
             "search_value": search_value,
-            "source": "dynamodb",
+            "source": "oracle",
         }
 
         if normalized_email:
@@ -3463,8 +3736,7 @@ async def get_user_bookings(
 # STUDENT / ADMIN: DELETE /meeting-cancel?booking_id=...
 @app.delete("/meeting-cancel")
 def meeting_cancel(booking_id: str, user=Depends(get_current_user)):
-    resp = bookings_table.get_item(Key={"bookingId": booking_id})
-    booking = resp.get("Item")
+    booking = bookings_table.get_booking(booking_id)
 
     if not booking:
         raise HTTPException(status_code=404, detail="Not found")
@@ -3472,12 +3744,7 @@ def meeting_cancel(booking_id: str, user=Depends(get_current_user)):
     if user["role"] == "student" and booking.get("created_by") != user["username"]:
         raise HTTPException(status_code=403, detail="Not your booking")
 
-    bookings_table.update_item(
-        Key={"bookingId": booking_id},
-        UpdateExpression="SET #st = :s",
-        ExpressionAttributeNames={"#st": "status"},
-        ExpressionAttributeValues={":s": "CANCELLED"},
-    )
+    bookings_table.cancel_booking(booking_id)
 
     # Invalidate caches after cancellation
     booking_date = booking.get("booking_date", "")
@@ -3489,36 +3756,24 @@ def meeting_cancel(booking_id: str, user=Depends(get_current_user)):
 
 
 # ==========================================
-# NEW: REDIS DEBUG ENDPOINTS (dev only)
+# NEW: CACHE DEBUG ENDPOINTS (dev only)
 # ==========================================
 
-@app.get("/meeting/redis/debug")
-def meeting_redis_debug(user=Depends(get_current_user)):
-    """
-    Admin-only: show active meeting keys in redis_service DB 8.
-    Useful for monitoring locks, holds, and cache state.
-    """
+@app.get("/meeting/cache/debug")
+def meeting_cache_debug(user=Depends(get_current_user)):
+    """Admin-only: show active in-process meeting cache keys."""
     if user["role"] != "admin":
         raise HTTPException(status_code=403, detail="Admin only")
-    try:
-        resp = http_requests.get(
-            f"{REDIS_SERVICE_URL}/redis/scan",
-            params={"pattern": "meeting:*", "db": _MEETING_DB},
-            timeout=3,
-        )
-        data = resp.json()
-        return {
-            "success": True,
-            "meeting_db": _MEETING_DB,
-            "active_keys": data.get("keys", []),
-            "count": data.get("count", 0),
-        }
-    except Exception as exc:
-        return {"success": False, "message": str(exc)}
+    keys = sorted(k for k in _CACHE_LOCAL.keys() if k.startswith("meeting:"))
+    return {
+        "success": True,
+        "active_keys": keys,
+        "count": len(keys),
+    }
 
 
-@app.get("/meeting/redis/hold")
-def meeting_redis_hold_status(user=Depends(get_current_user)):
+@app.get("/meeting/cache/hold")
+def meeting_cache_hold_status(user=Depends(get_current_user)):
     """Check current pending hold for the authenticated user."""
     hold = meeting_pending_hold_get(user["username"])
     return {
