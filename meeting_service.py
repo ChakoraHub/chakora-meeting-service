@@ -1742,15 +1742,15 @@ def optimize_predicted_price(
 
     lower_bound = heuristic_price * (1 - MAX_MODEL_PRICE_DELTA)
     upper_bound = heuristic_price * (1 + MAX_MODEL_PRICE_DELTA)
-    bounded_model_price = min(max(model_price, lower_bound), upper_bound) if model_price is not None else None
+    bounded_model_price = min(max(model_price, lower_bound), upper_bound)
     # Keep price exact to standard pro-rated rate table (no 200 minimum floor or ML drift)
     optimized_price = heuristic_price
 
     return optimized_price, {
         "strategy": "exact_standard_rate",
         "confidence": round(confidence, 4),
-        "ml_predicted_price": round(model_price, 2) if model_price is not None else None,
-        "bounded_ml_price": round(bounded_model_price, 2) if bounded_model_price is not None else None,
+        "ml_predicted_price": round(model_price, 2),
+        "bounded_ml_price": round(bounded_model_price, 2),
         "training_samples": training_samples,
         "model_r2": model_r2,
     }
@@ -2278,15 +2278,21 @@ def calculate_dynamic_price(
 
     hours = duration_minutes / 60.0
     multiplier = COMPLEXITY_MULTIPLIER.get(complexity, 1.0)
+    demand_factor = min(1 + (day_bookings_count * DEMAND_MULTIPLIER), MAX_DEMAND_FACTOR)
+    supply_factor = float(SUPPLY_PENALTY) if day_bookings_count > (TOTAL_STAFF * 0.7) else 0.0
+    lead_factor = lead_time_factor(lead_time_days)
+    time_factor = slot_time_factor(start_minutes)
+
     final_price = int(math.ceil(hours * BASE_RATE * multiplier))
 
     return final_price, {
         "base_calc": round(hours * BASE_RATE * multiplier, 2),
-        "demand_factor": 1.0,
-        "supply_factor": 0.0,
-        "lead_time_factor": 1.0,
-        "slot_time_factor": 1.0,
+        "demand_factor": round(demand_factor, 4),
+        "supply_factor": round(supply_factor, 2),
+        "lead_time_factor": round(lead_factor, 4),
+        "slot_time_factor": round(time_factor, 4),
         "final_price_raw": float(final_price),
+        "is_existing": is_existing,
     }
 
 
