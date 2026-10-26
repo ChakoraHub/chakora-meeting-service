@@ -1742,18 +1742,15 @@ def optimize_predicted_price(
 
     lower_bound = heuristic_price * (1 - MAX_MODEL_PRICE_DELTA)
     upper_bound = heuristic_price * (1 + MAX_MODEL_PRICE_DELTA)
-    bounded_model_price = min(max(model_price, lower_bound), upper_bound)
-    minimum_price = MINIMUM_CHARGE_EXISTING if heuristic_price <= MINIMUM_CHARGE_EXISTING else 200
-    optimized_price = apply_psychological_rounding(
-        (heuristic_price * (1 - confidence)) + (bounded_model_price * confidence),
-        minimum_price=minimum_price,
-    )
+    bounded_model_price = min(max(model_price, lower_bound), upper_bound) if model_price is not None else None
+    # Keep price exact to standard pro-rated rate table (no 200 minimum floor or ML drift)
+    optimized_price = heuristic_price
 
     return optimized_price, {
-        "strategy": "blended_ml_and_heuristic",
+        "strategy": "exact_standard_rate",
         "confidence": round(confidence, 4),
-        "ml_predicted_price": round(model_price, 2),
-        "bounded_ml_price": round(bounded_model_price, 2),
+        "ml_predicted_price": round(model_price, 2) if model_price is not None else None,
+        "bounded_ml_price": round(bounded_model_price, 2) if bounded_model_price is not None else None,
         "training_samples": training_samples,
         "model_r2": model_r2,
     }
@@ -2281,33 +2278,15 @@ def calculate_dynamic_price(
 
     hours = duration_minutes / 60.0
     multiplier = COMPLEXITY_MULTIPLIER.get(complexity, 1.0)
-    base_calc = hours * BASE_RATE * multiplier
-
-    demand_factor = min(1 + (day_bookings_count * DEMAND_MULTIPLIER), MAX_DEMAND_FACTOR)
-
-    supply_factor = 0.0
-    if day_bookings_count > (TOTAL_STAFF * 0.7):
-        supply_factor = float(SUPPLY_PENALTY)
-
-    lead_factor = lead_time_factor(lead_time_days)
-    time_factor = slot_time_factor(start_minutes)
-
-    final_price_raw = (base_calc * demand_factor * lead_factor * time_factor) + supply_factor
-
-    if lead_time_days >= 21:
-        final_price_raw = min(final_price_raw, base_calc * 0.90)
-    elif lead_time_days >= 14:
-        final_price_raw = min(final_price_raw, base_calc * 0.95)
-
-    final_price = apply_psychological_rounding(final_price_raw, minimum_price=200)
+    final_price = int(math.ceil(hours * BASE_RATE * multiplier))
 
     return final_price, {
-        "base_calc": round(base_calc, 2),
-        "demand_factor": round(demand_factor, 4),
-        "supply_factor": round(supply_factor, 2),
-        "lead_time_factor": round(lead_factor, 4),
-        "slot_time_factor": round(time_factor, 4),
-        "final_price_raw": round(final_price_raw, 2),
+        "base_calc": round(hours * BASE_RATE * multiplier, 2),
+        "demand_factor": 1.0,
+        "supply_factor": 0.0,
+        "lead_time_factor": 1.0,
+        "slot_time_factor": 1.0,
+        "final_price_raw": float(final_price),
     }
 
 
