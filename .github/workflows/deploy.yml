@@ -24,7 +24,7 @@ jobs:
             exit 1
           fi
 
-          status=$(curl --silent --show-error --location --max-time 20             --output maintenance-on-response.txt             --dump-header maintenance-on-headers.txt             --write-out "%{http_code}"             --header "Authorization: Bearer $MAINTENANCE_TOKEN"             --request POST "$MAINTENANCE_ON_URL" || true)
+          status=$(curl --silent --show-error --proto '=https' --proto-redir '=https' --location --max-time 20 --output maintenance-on-response.txt --dump-header maintenance-on-headers.txt --write-out "%{http_code}" --header "Authorization: Bearer $MAINTENANCE_TOKEN" --request POST "$MAINTENANCE_ON_URL" || true)
 
           echo "[maintenance:on] HTTP status: $status"
           cat maintenance-on-response.txt || true
@@ -42,7 +42,7 @@ jobs:
     needs: enable-maintenance
     steps:
       - name: SSH and Deploy to EC2
-        uses: appleboy/ssh-action@v1.2.0
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1.2.5
         with:
           host: ${{ secrets.AWS_HOST }}
           username: ${{ secrets.AWS_USERNAME }}
@@ -62,7 +62,7 @@ jobs:
     needs: deploy
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -137,7 +137,7 @@ jobs:
             exit 1
           fi
 
-          status=$(curl --silent --show-error --location --max-time 20             --output maintenance-off-response.txt             --dump-header maintenance-off-headers.txt             --write-out "%{http_code}"             --header "Authorization: Bearer $MAINTENANCE_TOKEN"             --request POST "$MAINTENANCE_OFF_URL" || true)
+          status=$(curl --silent --show-error --proto '=https' --proto-redir '=https' --location --max-time 20 --output maintenance-off-response.txt --dump-header maintenance-off-headers.txt --write-out "%{http_code}" --header "Authorization: Bearer $MAINTENANCE_TOKEN" --request POST "$MAINTENANCE_OFF_URL" || true)
 
           echo "[maintenance:off] HTTP status: $status"
           cat maintenance-off-response.txt || true

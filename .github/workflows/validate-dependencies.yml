@@ -1,0 +1,31 @@
+name: Validate Meeting Dependencies
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "requirements.txt"
+      - "requirements-test.txt"
+      - "meeting_service.py"
+      - ".github/workflows/validate-dependencies.yml"
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Python 3.10
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v5
+        with:
+          python-version: "3.10"
+      - name: Install production dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Install test dependencies
+        run: python -m pip install -r requirements-test.txt
+      - name: Check dependency consistency
+        run: python -m pip check
+      - name: Verify application imports
+        run: python -c "import boto3, dotenv, fastapi, kafka, numpy, oracledb, pydantic, requests, sklearn, uvicorn, werkzeug; print('Core imports successful')"
+      - name: Compile application
+        run: python -m py_compile meeting_service.py
