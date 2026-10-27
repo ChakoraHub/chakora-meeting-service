@@ -1,7 +1,11 @@
+
 name: Deploy Meeting Service
 
 on:
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   enable-maintenance:
@@ -14,27 +18,24 @@ jobs:
           MAINTENANCE_TOKEN: ${{ secrets.MAINTENANCE_TOKEN }}
         run: |
           set -e
-          echo "[maintenance:on] Starting maintenance enable request"
-          test -n "$MAINTENANCE_ON_URL" || { echo "Missing MEETING_MAINTENANCE_ON_URL secret"; exit 1; }
+          test -n "$MAINTENANCE_ON_URL" || { echo "Missing maintenance URL secret"; exit 1; }
+          test -n "$MAINTENANCE_TOKEN" || { echo "Missing maintenance token"; exit 1; }
 
-          if [ -n "$MAINTENANCE_TOKEN" ]; then
-            echo "[maintenance:on] MAINTENANCE_TOKEN is configured (length: ${#MAINTENANCE_TOKEN})"
-          else
-            echo "[maintenance:on] MAINTENANCE_TOKEN is empty"
-            exit 1
-          fi
+          status=$(curl --silent --show-error \
+            --proto '=https' --proto-redir '=https' \
+            --location --max-time 20 \
+            --output maintenance-on-response.txt \
+            --write-out "%{http_code}" \
+            --header "Authorization: Bearer $MAINTENANCE_TOKEN" \
+            --request POST "$MAINTENANCE_ON_URL" || true)
 
-          status=$(curl --silent --show-error --proto '=https' --proto-redir '=https' --location --max-time 20 --output maintenance-on-response.txt --dump-header maintenance-on-headers.txt --write-out "%{http_code}" --header "Authorization: Bearer $MAINTENANCE_TOKEN" --request POST "$MAINTENANCE_ON_URL" || true)
-
-          echo "[maintenance:on] HTTP status: $status"
+          echo "Maintenance enable HTTP status: $status"
           cat maintenance-on-response.txt || true
 
-          if [ "$status" -lt 200 ] || [ "$status" -ge 300 ]; then
-            echo "[maintenance:on] Request failed"
+          if ! [[ "$status" =~ ^2[0-9][0-9]$ ]]; then
+            echo "Maintenance enable request failed."
             exit 1
           fi
-
-          echo "[maintenance:on] Maintenance enabled successfully"
 
   deploy:
     name: Deploy Meeting to EC2
@@ -48,13 +49,28 @@ jobs:
           username: ${{ secrets.AWS_USERNAME }}
           key: ${{ secrets.AWS_PRIVATE_KEY }}
           script: |
-            set -e
+            set -euo pipefail
             cd "${{ secrets.APP_PATH }}"
+
             git fetch origin main
-            git checkout -f -B main origin/main
-            ./venv/bin/pip install -r requirements.txt
+
+            if ! git diff --quiet || ! git diff --cached --quiet; then
+              echo "Tracked server changes detected. Aborting deployment."
+              exit 1
+            fi
+
+            git switch main
+            git pull --ff-only origin main
+
+            test -x ./venv/bin/python
+            test -f requirements.txt
+
+            ./venv/bin/python -m pip install --only-binary=:all: -r requirements.txt
+            ./venv/bin/python -m pip check
+
             pm2 restart meeting-service
-            echo "Meeting deployment completed successfully."
+            pm2 describe meeting-service
+            echo "Meeting deployment completed."
 
   selenium-smoke-tests:
     name: Meeting Selenium Smoke Tests
@@ -65,35 +81,37 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v5
         with:
           python-version: "3.13"
 
       - name: Install Chrome
-        uses: browser-actions/setup-chrome@v2
+        uses: browser-actions/setup-chrome@48ad923757ca74d66703209fe939badbdf80f2f4 # v2
         with:
           chrome-version: "153.0.8010.52"
           install-chromedriver: true
 
       - name: Install Selenium test dependencies
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install selenium pytest
+          python -m pip install --only-binary=:all: "selenium==4.38.0" "pytest==8.4.2"
 
       - name: Wait for deployed Meeting page
         env:
           MEETING_URL: https://www.chakorahub.com/meeting
         run: |
           for attempt in {1..12}; do
-            if curl --fail --silent --show-error --location --max-time 10 "$MEETING_URL" > /dev/null; then
-              echo "Deployed Meeting website is responding."
+            if curl --fail --silent --show-error \
+              --proto '=https' --proto-redir '=https' \
+              --location --max-time 10 "$MEETING_URL" > /dev/null; then
+              echo "Meeting website is responding."
               exit 0
             fi
+
             echo "Meeting website not ready (attempt $attempt/12)."
             sleep 10
           done
 
-          echo "Deployed Meeting website did not become ready."
+          echo "Meeting website did not become ready."
           exit 1
 
       - name: Run Selenium smoke tests
@@ -109,7 +127,7 @@ jobs:
 
       - name: Upload Selenium results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v4
         with:
           name: meeting-selenium-results
           path: meeting-selenium-results.xml
@@ -127,24 +145,21 @@ jobs:
           MAINTENANCE_TOKEN: ${{ secrets.MAINTENANCE_TOKEN }}
         run: |
           set -e
-          echo "[maintenance:off] Starting maintenance disable request"
-          test -n "$MAINTENANCE_OFF_URL" || { echo "Missing MEETING_MAINTENANCE_OFF_URL secret"; exit 1; }
+          test -n "$MAINTENANCE_OFF_URL" || { echo "Missing maintenance URL secret"; exit 1; }
+          test -n "$MAINTENANCE_TOKEN" || { echo "Missing maintenance token"; exit 1; }
 
-          if [ -n "$MAINTENANCE_TOKEN" ]; then
-            echo "[maintenance:off] MAINTENANCE_TOKEN is configured (length: ${#MAINTENANCE_TOKEN})"
-          else
-            echo "[maintenance:off] MAINTENANCE_TOKEN is empty"
-            exit 1
-          fi
+          status=$(curl --silent --show-error \
+            --proto '=https' --proto-redir '=https' \
+            --location --max-time 20 \
+            --output maintenance-off-response.txt \
+            --write-out "%{http_code}" \
+            --header "Authorization: Bearer $MAINTENANCE_TOKEN" \
+            --request POST "$MAINTENANCE_OFF_URL" || true)
 
-          status=$(curl --silent --show-error --proto '=https' --proto-redir '=https' --location --max-time 20 --output maintenance-off-response.txt --dump-header maintenance-off-headers.txt --write-out "%{http_code}" --header "Authorization: Bearer $MAINTENANCE_TOKEN" --request POST "$MAINTENANCE_OFF_URL" || true)
-
-          echo "[maintenance:off] HTTP status: $status"
+          echo "Maintenance disable HTTP status: $status"
           cat maintenance-off-response.txt || true
 
-          if [ "$status" -lt 200 ] || [ "$status" -ge 300 ]; then
-            echo "[maintenance:off] Request failed"
+          if ! [[ "$status" =~ ^2[0-9][0-9]$ ]]; then
+            echo "Maintenance disable request failed."
             exit 1
           fi
-
-          echo "[maintenance:off] Maintenance disabled successfully"
