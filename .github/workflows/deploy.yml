@@ -1,0 +1,225 @@
+name: Deploy Meeting Service
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate-dependencies:
+    name: Validate dependencies and application
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v5
+        with:
+          python-version: "3.10"
+
+      - name: Install production dependencies
+        run: python -m pip install --only-binary=:all: -r requirements.txt
+
+      - name: Install test dependencies
+        run: python -m pip install --only-binary=:all: -r requirements-test.txt
+
+      - name: Check dependency consistency
+        run: python -m pip check
+
+      - name: Verify application imports
+        run: |
+          python -c "import boto3, dotenv, fastapi, kafka, numpy, oracledb, pydantic, requests, sklearn, uvicorn, werkzeug; print('Core imports successful')"
+
+      - name: Compile application
+        run: python -m py_compile meeting_service.py
+
+  enable-maintenance:
+    name: Enable maintenance mode
+    runs-on: ubuntu-latest
+    needs: validate-dependencies
+
+    steps:
+      - name: Enable maintenance through Meeting FastAPI
+        env:
+          MAINTENANCE_ON_URL: ${{ secrets.MEETING_MAINTENANCE_ON_URL }}
+          MAINTENANCE_TOKEN: ${{ secrets.MAINTENANCE_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          test -n "$MAINTENANCE_ON_URL" || {
+            echo "Missing maintenance URL secret"
+            exit 1
+          }
+
+          test -n "$MAINTENANCE_TOKEN" || {
+            echo "Missing maintenance token"
+            exit 1
+          }
+
+          status=$(curl --silent --show-error \
+            --proto '=https' --proto-redir '=https' \
+            --location --max-time 20 \
+            --output maintenance-on-response.txt \
+            --write-out "%{http_code}" \
+            --header "Authorization: Bearer $MAINTENANCE_TOKEN" \
+            --request POST "$MAINTENANCE_ON_URL" || true)
+
+          echo "Maintenance enable HTTP status: $status"
+          cat maintenance-on-response.txt || true
+
+          if ! [[ "$status" =~ ^2[0-9][0-9]$ ]]; then
+            echo "Maintenance enable request failed."
+            exit 1
+          fi
+
+  deploy:
+    name: Deploy Meeting to EC2
+    runs-on: ubuntu-latest
+    needs: enable-maintenance
+
+    steps:
+      - name: SSH and deploy to EC2
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1.2.5
+        with:
+          host: ${{ secrets.AWS_HOST }}
+          username: ${{ secrets.AWS_USERNAME }}
+          key: ${{ secrets.AWS_PRIVATE_KEY }}
+          script: |
+            set -euo pipefail
+
+            cd "${{ secrets.APP_PATH }}"
+
+            git fetch origin main
+
+            if ! git diff --quiet || ! git diff --cached --quiet; then
+              echo "Tracked server changes detected. Aborting deployment."
+              exit 1
+            fi
+
+            git switch main
+            git pull --ff-only origin main
+
+            test -x ./venv/bin/python
+            test -f requirements.txt
+            test -f meeting_service.py
+
+            ./venv/bin/python -m pip install --only-binary=:all: -r requirements.txt
+
+            ./venv/bin/python -m pip check
+
+            ./venv/bin/python -c "import boto3, dotenv, fastapi, kafka, numpy, oracledb, pydantic, requests, sklearn, uvicorn, werkzeug; print('Core imports successful')"
+
+            ./venv/bin/python -m py_compile meeting_service.py
+
+            pm2 restart meeting-service
+            pm2 describe meeting-service
+
+            echo "Meeting deployment completed."
+
+  selenium-smoke-tests:
+    name: Meeting Selenium Smoke Tests
+    runs-on: ubuntu-latest
+    needs: deploy
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v5
+        with:
+          python-version: "3.10"
+
+      - name: Install Chrome
+        uses: browser-actions/setup-chrome@48ad923757ca74d66703209fe939badbdf80f2f4 # v2
+        with:
+          chrome-version: "153.0.8010.52"
+          install-chromedriver: true
+
+      - name: Install Selenium test dependencies
+        run: |
+          python -m pip install --only-binary=:all: "selenium==4.38.0" "pytest==8.4.2"
+
+      - name: Wait for deployed Meeting page
+        env:
+          MEETING_URL: https://www.chakorahub.com/meeting
+        run: |
+          for attempt in {1..12}; do
+            if curl --fail --silent --show-error \
+              --proto '=https' --proto-redir '=https' \
+              --location --max-time 10 "$MEETING_URL" > /dev/null; then
+              echo "Meeting website is responding."
+              exit 0
+            fi
+
+            echo "Meeting website not ready (attempt $attempt/12)."
+            sleep 10
+          done
+
+          echo "Meeting website did not become ready."
+          exit 1
+
+      - name: Run Selenium smoke tests
+        env:
+          HOME_URL: https://www.chakorahub.com
+          MEETING_HOME_URL: https://www.chakorahub.com
+          MEETING_URL: https://www.chakorahub.com/meeting
+          MEETING_ADMIN_URL: https://www.chakorahub.com/meeting/admin
+          EXPECT_MAINTENANCE_NOTICE: "true"
+          RUN_MEETING_WRITE_TESTS: "false"
+        run: |
+          pytest -v test_meeting_smoke.py --junitxml=meeting-selenium-results.xml
+
+      - name: Upload Selenium results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v4
+        with:
+          name: meeting-selenium-results
+          path: meeting-selenium-results.xml
+          if-no-files-found: warn
+
+  disable-maintenance:
+    name: Disable maintenance after deployment checks
+    runs-on: ubuntu-latest
+    needs:
+      - enable-maintenance
+      - deploy
+      - selenium-smoke-tests
+    if: ${{ always() && needs.enable-maintenance.result == 'success' }}
+
+    steps:
+      - name: Disable maintenance through Meeting FastAPI
+        env:
+          MAINTENANCE_OFF_URL: ${{ secrets.MEETING_MAINTENANCE_OFF_URL }}
+          MAINTENANCE_TOKEN: ${{ secrets.MAINTENANCE_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          test -n "$MAINTENANCE_OFF_URL" || {
+            echo "Missing maintenance URL secret"
+            exit 1
+          }
+
+          test -n "$MAINTENANCE_TOKEN" || {
+            echo "Missing maintenance token"
+            exit 1
+          }
+
+          status=$(curl --silent --show-error \
+            --proto '=https' --proto-redir '=https' \
+            --location --max-time 20 \
+            --output maintenance-off-response.txt \
+            --write-out "%{http_code}" \
+            --header "Authorization: Bearer $MAINTENANCE_TOKEN" \
+            --request POST "$MAINTENANCE_OFF_URL" || true)
+
+          echo "Maintenance disable HTTP status: $status"
+          cat maintenance-off-response.txt || true
+
+          if ! [[ "$status" =~ ^2[0-9][0-9]$ ]]; then
+            echo "Maintenance disable request failed."
+            exit 1
+          fi
