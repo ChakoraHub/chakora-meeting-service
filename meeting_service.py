@@ -10,6 +10,8 @@ import re
 import pathlib
 import threading
 import time as time_module
+from pathlib import Path
+import secrets
 import boto3
 import json
 import urllib.parse
@@ -251,6 +253,22 @@ def _process_completed_bookings():
 # ------------------------------
 # ENV & AWS CLIENTS
 # ------------------------------
+# ------------------------------
+# MAINTENANCE MODE
+# ------------------------------
+MAINTENANCE_FLAG = Path(
+    os.getenv(
+        "MAINTENANCE_FLAG",
+        "/home/ec2-user/meeting-maintenance.flag"
+    )
+)
+
+MAINTENANCE_TOKEN = os.getenv("MAINTENANCE_TOKEN")
+
+
+def is_maintenance_enabled() -> bool:
+    return MAINTENANCE_FLAG.exists()
+
 AWS_REGION = os.getenv("AWS_REGION", "eu-north-1")
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "admin@chakorahub.com")
 ADMIN_PANEL_URL = os.getenv(
@@ -848,6 +866,52 @@ EMAIL_REGEX = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
 # FASTAPI APP & CORS
 # ------------------------------
 app = FastAPI(title="ChakoraHub Meeting Service")
+
+@app.get("/meeting/maintenance/status")
+def maintenance_status():
+    return {
+        "maintenance_mode": is_maintenance_enabled()
+    }
+
+def verify_maintenance_token(request: Request):
+    supplied_token = request.headers.get(
+        "Authorization", ""
+    ).removeprefix("Bearer ").strip()
+
+    if not MAINTENANCE_TOKEN or not secrets.compare_digest(
+        supplied_token, MAINTENANCE_TOKEN
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized"
+        )
+
+@app.post("/admin/maintenance/on")
+def enable_maintenance(request: Request):
+    verify_maintenance_token(request)
+
+    MAINTENANCE_FLAG.parent.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    MAINTENANCE_FLAG.touch()
+
+    return {
+        "success": True,
+        "maintenance_mode": True
+    }
+
+@app.post("/admin/maintenance/off")
+def disable_maintenance(request: Request):
+    verify_maintenance_token(request)
+
+    MAINTENANCE_FLAG.unlink(missing_ok=True)
+
+    return {
+        "success": True,
+        "maintenance_mode": False
+    }
 
 app.add_middleware(
     CORSMiddleware,
